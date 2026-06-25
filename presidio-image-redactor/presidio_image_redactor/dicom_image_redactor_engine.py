@@ -321,7 +321,10 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
         :param instance: A singe DICOM instance.
         :param is_greyscale: FALSE if the Photometric Interpretation is RGB.
 
-        :return: Rescaled DICOM pixel_array.
+        :return: Rescaled DICOM pixel_array as a 2-D array. For multi-frame
+            greyscale images (e.g. XA modality cine loops), only the first
+            frame is returned; burned-in annotations share the same position
+            across frames so a single frame is sufficient for PII detection.
         """
         # Normalize contrast
         if "WindowWidth" in instance:
@@ -331,6 +334,12 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
                 image_2d = instance.pixel_array
         else:
             image_2d = instance.pixel_array
+
+        # Multi-frame greyscale DICOMs (e.g. XA modality) have a 3-D pixel
+        # array with shape (frames, rows, cols). Extract the first frame so
+        # that downstream PIL conversion and OCR always receive a 2-D array.
+        if is_greyscale and image_2d.ndim == 3:
+            image_2d = image_2d[0]
 
         # Convert to float to avoid overflow or underflow losses.
         image_2d_float = image_2d.astype(float)
@@ -761,12 +770,15 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
             raise ValueError("fill must be 'contrast' or 'background'")
 
         is_greyscale = cls._check_if_greyscale(instance)
+        pixel_array = instance.pixel_array
         if is_greyscale:
             # model L for grayscale, and has 8 bit-pixel to store the pixel value
-            image_pil = Image.fromarray(instance.pixel_array, mode="L")
+            # For multi-frame images, use the first frame for PIL conversion.
+            frame = pixel_array[0] if pixel_array.ndim == 3 else pixel_array
+            image_pil = Image.fromarray(frame, mode="L")
         else:
             # model RGB, has 3x8 bit pixel available to store the value
-            image_pil = Image.fromarray(instance.pixel_array, mode="RGB")
+            image_pil = Image.fromarray(pixel_array, mode="RGB")
         box_color = cls._get_bg_color(image_pil, is_greyscale, invert_flag)
 
         return box_color
@@ -874,17 +886,22 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
             box_color = cls._set_bbox_color(redacted_instance, fill)
 
         # Apply mask
+        pixel_array = redacted_instance.pixel_array.copy()
+        is_multi_frame = pixel_array.ndim == 3
         for i in range(0, len(bounding_boxes_coordinates)):
             bbox = bounding_boxes_coordinates[i]
             top = bbox["top"]
             left = bbox["left"]
             width = bbox["width"]
             height = bbox["height"]
-            redacted_instance.pixel_array[top : top + height, left : left + width] = (
-                box_color
-            )
+            if is_multi_frame:
+                # Redact the same region in every frame so burned-in
+                # annotations are removed regardless of which frame is shown.
+                pixel_array[:, top : top + height, left : left + width] = box_color
+            else:
+                pixel_array[top : top + height, left : left + width] = box_color
 
-        redacted_instance.PixelData = redacted_instance.pixel_array.tobytes()
+        redacted_instance.PixelData = pixel_array.tobytes()
 
         # If original pixel data is compressed, recompress after redaction
         if is_compressed or has_image_icon_sequence:

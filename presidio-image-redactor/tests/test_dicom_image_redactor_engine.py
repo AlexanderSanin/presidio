@@ -161,6 +161,42 @@ def test_check_if_greyscale_happy_path(mock_engine: DicomImageRedactorEngine, dc
         assert len(np.shape(test_scaled_image)) == 3
 
 
+def test_rescale_dcm_pixel_array_multiframe_greyscale(mock_engine: DicomImageRedactorEngine):
+    """_rescale_dcm_pixel_array returns a 2-D array for multi-frame greyscale DICOM (e.g. XA modality).
+
+    Regression test for https://github.com/microsoft/presidio/issues/1731
+    """
+    # Arrange - build a minimal 3-frame greyscale DICOM dataset in-memory
+    ds = pydicom.Dataset()
+    ds.file_meta = pydicom.dataset.FileMetaDataset()
+    ds.is_implicit_VR = False
+    ds.is_little_endian = True
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.Rows = 4
+    ds.Columns = 4
+    ds.NumberOfFrames = 3
+    ds.SamplesPerPixel = 1
+    frames = np.array(
+        [[[10, 20, 30, 40]] * 4,
+         [[50, 60, 70, 80]] * 4,
+         [[90, 100, 110, 120]] * 4],
+        dtype=np.uint8,
+    )
+    ds.PixelData = frames.tobytes()
+
+    # Act
+    result = mock_engine._rescale_dcm_pixel_array(ds, is_greyscale=True)
+
+    # Assert
+    assert result.ndim == 2, "Multi-frame greyscale DICOM should produce a 2-D scaled array"
+    assert result.shape == (4, 4)
+    assert result.dtype == np.uint8
+
+
 # ------------------------------------------------------
 # testing the conversation of np.array to PIL image
 # ------------------------------------------------------
@@ -1129,6 +1165,57 @@ def test_add_redact_box_happy_path(
         assert mock_set_bbox_color.call_count == 1
 
     assert box_color_pixels_redacted > box_color_pixels_original
+
+
+def _make_multiframe_greyscale_dicom(frames: int = 3, rows: int = 8, cols: int = 8) -> pydicom.Dataset:
+    """Return a minimal in-memory multi-frame greyscale DICOM dataset."""
+    ds = pydicom.Dataset()
+    ds.file_meta = pydicom.dataset.FileMetaDataset()
+    ds.is_implicit_VR = False
+    ds.is_little_endian = True
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.Rows = rows
+    ds.Columns = cols
+    ds.NumberOfFrames = frames
+    ds.SamplesPerPixel = 1
+    pixel_data = np.zeros((frames, rows, cols), dtype=np.uint8)
+    ds.PixelData = pixel_data.tobytes()
+    return ds
+
+
+def test_set_bbox_color_multiframe_greyscale(mock_engine: DicomImageRedactorEngine):
+    """_set_bbox_color does not raise for multi-frame greyscale DICOM (e.g. XA modality).
+
+    Regression test for https://github.com/microsoft/presidio/issues/1731
+    """
+    ds = _make_multiframe_greyscale_dicom()
+
+    # Should not raise ValueError: Too many dimensions: 3 > 2
+    color = mock_engine._set_bbox_color(ds, fill="contrast")
+    assert isinstance(color, (int, np.integer))
+
+
+def test_add_redact_box_multiframe_greyscale(mock_engine: DicomImageRedactorEngine):
+    """_add_redact_box applies bounding boxes across all frames for multi-frame greyscale DICOM.
+
+    Regression test for https://github.com/microsoft/presidio/issues/1731
+    """
+    ds = _make_multiframe_greyscale_dicom(frames=3, rows=8, cols=8)
+
+    bboxes = [{"top": 0, "left": 0, "width": 2, "height": 2}]
+    result = mock_engine._add_redact_box(ds, bboxes, crop_ratio=0.75, fill="background")
+
+    result_array = result.pixel_array
+    assert result_array.ndim == 3, "Redacted DICOM should still be multi-frame"
+    # The redacted corner should have been overwritten in every frame
+    for frame_idx in range(3):
+        assert result_array[frame_idx, 0, 0] == result_array[0, 0, 0], (
+            f"Frame {frame_idx} was not redacted"
+        )
 
 
 # ------------------------------------------------------
